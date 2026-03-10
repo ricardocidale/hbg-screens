@@ -1,0 +1,637 @@
+/**
+ * PropertyDetail.tsx — Single-property financial dashboard.
+ *
+ * Displays the full pro-forma output for one property, organized into tabs:
+ *   • Income Statement — yearly revenue, expenses, GOP, management fees, NOI
+ *   • Cash Flow Statement — operating / investing / financing activities, FCF, FCFE
+ *   • Balance Sheet — consolidated balance sheet for this property
+ *   • PPE Schedule — Property, Plant & Equipment cost-basis and depreciation
+ *
+ * The page runs the financial engine (`generatePropertyProForma`) to produce
+ * monthly line items, then aggregates them into annual totals for display. It
+ * also computes loan parameters (LTV, amortization, refi) to populate the cash
+ * flow statement's financing section.
+ *
+ * Export capabilities:
+ *   • PDF — full cash flow table + performance chart on a second page
+ *   • Excel — per-statement workbooks via the shared excelExport module
+ *   • CSV — raw cash flow data dump
+ *   • PowerPoint — summary slides via pptxExport
+ *   • PNG — screenshot of the visible chart or table
+ *
+ * The page respects the fiscal-year-start-month setting, so FY labels align
+ * with the company's chosen fiscal calendar (e.g. FY 2027 may start in October).
+ */
+import { useMemo, useState, useRef } from "react";
+import Layout from "@/components/Layout";
+import { useProperty, useGlobalAssumptions } from "@/lib/api";
+import { generatePropertyProForma, formatMoney, getFiscalYearForModelYear } from "@/lib/financialEngine";
+import { ConsolidatedBalanceSheet } from "@/components/ConsolidatedBalanceSheet";
+import { CalcDetailsProvider } from "@/components/financial-table-rows";
+import { Tabs, TabsContent, CurrentThemeTab } from "@/components/ui/tabs";
+import { Loader2 } from "lucide-react";
+import { IconAlertTriangle, IconIncomeStatement, IconCashFlow, IconBalanceSheet, IconPPE } from "@/components/icons";import { ExportMenu, pdfAction, excelAction, csvAction, pptxAction, chartAction, pngAction } from "@/components/ui/export-toolbar";
+import { downloadCSV } from "@/lib/exports/csvExport";
+import { exportPropertyPPTX } from "@/lib/exports/pptxExport";
+import {
+  exportPropertyIncomeStatement,
+  exportPropertyCashFlow,
+  exportPropertyBalanceSheet,
+  exportFullPropertyWorkbook,
+} from "@/lib/exports/excelExport";
+import domtoimage from 'dom-to-image-more';
+import { Link, useRoute } from "wouter";
+import { Button } from "@/components/ui/button";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
+import { drawLineChart } from "@/lib/exports/pdfChartDrawer";
+import { calculateLoanParams, LoanParams, GlobalLoanParams, DEFAULT_LTV, PROJECTION_YEARS } from "@/lib/financial/loanCalculations";
+import { aggregateCashFlowByYear } from "@/lib/financial/cashFlowAggregator";
+import { aggregatePropertyByYear } from "@/lib/financial/yearlyAggregator";
+import { computeCashFlowSections } from "@/lib/financial/cashFlowSections";
+import { useQueryClient } from "@tanstack/react-query";
+import { ExportDialog, type ExportVersion } from "@/components/ExportDialog";
+import { AnimatedPage, ScrollReveal } from "@/components/graphics";
+import {
+  PPECostBasisSchedule,
+  IncomeStatementTab,
+  CashFlowTab,
+  PropertyHeader,
+  PropertyKPIs,
+  BenchmarkPanel,
+} from "@/components/property-detail";
+
+export default function PropertyDetail() {
+  const [, params] = useRoute("/property/:id");
+  const propertyId = params?.id ? parseInt(params.id) : 0;
+  const [activeTab, setActiveTab] = useState("income");
+  const queryClient = useQueryClient();
+  const incomeChartRef = useRef<HTMLDivElement>(null);
+  const cashFlowChartRef = useRef<HTMLDivElement>(null);
+  const incomeTableRef = useRef<HTMLDivElement>(null);
+  const cashFlowTableRef = useRef<HTMLDivElement>(null);
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportType, setExportType] = useState<'pdf' | 'chart' | 'tablePng'>('pdf');
+  const [incomeAllExpanded, setIncomeAllExpanded] = useState(false);
+  
+  const { data: property, isLoading: propertyLoading, isError: propertyError } = useProperty(propertyId);
+  const { data: global, isLoading: globalLoading, isError: globalError } = useGlobalAssumptions();
+  
+  const handlePhotoUploadComplete = () => {
+    queryClient.invalidateQueries({ queryKey: ["/api/properties", propertyId] });
+  };
+
+  const projectionYears = global?.projectionYears ?? PROJECTION_YEARS;
+  const projectionMonths = projectionYears * 12;
+  const fiscalYearStartMonth = global?.fiscalYearStartMonth ?? 1;
+  const getFiscalYear = (yearIndex: number) => global ? getFiscalYearForModelYear(global.modelStartDate, fiscalYearStartMonth, yearIndex) : 2026 + yearIndex;
+  const financials = useMemo(
+    () => (property && global) ? generatePropertyProForma(property, global, projectionMonths) : [],
+    [property, global, projectionMonths]
+  );
+
+  // Aggregate monthly financials into yearly totals for the performance chart.
+  // Each bar/line in the chart needs a single number per year, so we sum 12 months.
+  const yearlyChartData = useMemo(() => {
+    const data = [];
+    for (let y = 0; y < projectionYears; y++) {
+      const yearData = financials.slice(y * 12, (y + 1) * 12);
+      if (yearData.length === 0) continue;
+      data.push({
+        year: String(getFiscalYear(y)),
+        Revenue: yearData.reduce((a, m) => a + m.revenueTotal, 0),
+        GOP: yearData.reduce((a, m) => a + m.gop, 0),
+        AGOP: yearData.reduce((a, m) => a + m.agop, 0),
+        NOI: yearData.reduce((a, m) => a + m.noi, 0),
+        ANOI: yearData.reduce((a, m) => a + m.anoi, 0),
+        CashFlow: yearData.reduce((a, m) => a + m.cashFlow, 0),
+      });
+    }
+    return data;
+  }, [financials, projectionYears]);
+
+  const years = projectionYears;
+  const startYear = getFiscalYear(0);
+
+  // Compute yearly cash-flow rows (ATCF, exit value, debt service, refi proceeds)
+  // using the shared aggregator. This feeds the Cash Flow Statement tab.
+  const cashFlowDataMemo = useMemo(() => {
+    if (!property || !global || financials.length === 0) return [];
+    return aggregateCashFlowByYear(financials, property as LoanParams, global as GlobalLoanParams, years);
+  }, [financials, property, global, years]);
+
+  // Aggregate monthly income-statement data into yearly totals for the IS tab.
+  const yearlyDetails = useMemo(
+    () => aggregatePropertyByYear(financials, years),
+    [financials, years]
+  );
+
+  if (propertyLoading || globalLoading) {
+    return (
+      <Layout>
+        <div className="flex items-center justify-center h-[60vh]">
+          <Loader2 className="w-8 h-8 animate-spin text-primary" />
+        </div>
+      </Layout>
+    );
+  }
+
+  if (propertyError || globalError) {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center h-[60vh] gap-3">
+          <IconAlertTriangle className="w-8 h-8 text-destructive" />
+          <p className="text-muted-foreground">Failed to load property data. Please try refreshing the page.</p>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (!property || !global) {
+    return (
+      <Layout>
+        <div className="flex flex-col items-center justify-center h-[60vh] text-center space-y-4">
+          <h2 className="text-2xl font-display">Property Not Found</h2>
+          <Link href="/portfolio">
+            <Button>Return to Portfolio</Button>
+          </Link>
+        </div>
+      </Layout>
+    );
+  }
+
+  const getCashFlowData = () => cashFlowDataMemo;
+
+  const exportCashFlowCSV = () => {
+
+    const cashFlowData = getCashFlowData();
+    const headers = ["Line Item", ...Array.from({length: years}, (_, i) => `FY ${startYear + i}`)];
+    
+    const csvLoan = calculateLoanParams(property as LoanParams, global as GlobalLoanParams);
+    const csvAcqYear = Math.floor(csvLoan.acqMonthsFromModelStart / 12);
+    const csvTotalPropertyCost = (property as any).purchasePrice + ((property as any).buildingImprovements ?? 0) + ((property as any).preOpeningCosts ?? 0);
+
+    const s = computeCashFlowSections(yearlyDetails, cashFlowData, csvLoan, csvAcqYear, csvTotalPropertyCost, years);
+
+    const rows = [
+      ["CASH FLOW FROM OPERATING ACTIVITIES"],
+      ["Cash Received from Guests & Clients", ...yearlyDetails.map(y => y.revenueTotal.toFixed(0))],
+      ["  Guest Room Revenue", ...yearlyDetails.map(y => y.revenueRooms.toFixed(0))],
+      ["  Event & Venue Revenue", ...yearlyDetails.map(y => y.revenueEvents.toFixed(0))],
+      ["  Food & Beverage Revenue", ...yearlyDetails.map(y => y.revenueFB.toFixed(0))],
+      ["  Other Revenue (Spa/Experiences)", ...yearlyDetails.map(y => y.revenueOther.toFixed(0))],
+      ["Cash Paid for Operating Expenses", ...yearlyDetails.map(y => (-(y.totalExpenses - y.expenseFFE)).toFixed(0))],
+      ["  Housekeeping & Room Operations", ...yearlyDetails.map(y => y.expenseRooms.toFixed(0))],
+      ["  Food & Beverage Costs", ...yearlyDetails.map(y => y.expenseFB.toFixed(0))],
+      ["  Event Operations", ...yearlyDetails.map(y => y.expenseEvents.toFixed(0))],
+      ["  Marketing & Platform Fees", ...yearlyDetails.map(y => y.expenseMarketing.toFixed(0))],
+      ["  Property Operations & Maintenance", ...yearlyDetails.map(y => y.expensePropertyOps.toFixed(0))],
+      ["  Utilities (Variable)", ...yearlyDetails.map(y => y.expenseUtilitiesVar.toFixed(0))],
+      ["  Utilities (Fixed)", ...yearlyDetails.map(y => y.expenseUtilitiesFixed.toFixed(0))],
+      ["  Insurance", ...yearlyDetails.map(y => y.expenseInsurance.toFixed(0))],
+      ["  Property Taxes", ...yearlyDetails.map(y => y.expenseTaxes.toFixed(0))],
+      ["  Administrative & Compliance", ...yearlyDetails.map(y => y.expenseAdmin.toFixed(0))],
+      ["  IT Systems", ...yearlyDetails.map(y => y.expenseIT.toFixed(0))],
+      ["  Other Operating Costs", ...yearlyDetails.map(y => y.expenseOtherCosts.toFixed(0))],
+      ["  Base Management Fee", ...yearlyDetails.map(y => y.feeBase.toFixed(0))],
+      ["  Incentive Management Fee", ...yearlyDetails.map(y => y.feeIncentive.toFixed(0))],
+      ["Less: Interest Paid", ...cashFlowData.map(y => (-y.interestExpense).toFixed(0))],
+      ["Less: Income Taxes Paid", ...cashFlowData.map(y => (-y.taxLiability).toFixed(0))],
+      ["Net Cash from Operating Activities", ...s.cashFromOperations.map(v => v.toFixed(0))],
+      [""],
+      ["CASH FLOW FROM INVESTING ACTIVITIES"],
+      ["Property Acquisition", ...cashFlowData.map((_, i) => (i === csvAcqYear ? -csvTotalPropertyCost : 0).toFixed(0))],
+      ["FF&E Reserve / Capital Improvements", ...yearlyDetails.map(y => (-y.expenseFFE).toFixed(0))],
+      ["Sale Proceeds (Net Exit Value)", ...cashFlowData.map(y => y.exitValue.toFixed(0))],
+      ["Net Cash from Investing Activities", ...s.cashFromInvesting.map(v => v.toFixed(0))],
+      [""],
+      ["CASH FLOW FROM FINANCING ACTIVITIES"],
+      ["Equity Contribution", ...cashFlowData.map((_, i) => (i === csvAcqYear ? csvLoan.equityInvested : 0).toFixed(0))],
+      ["Loan Proceeds", ...cashFlowData.map((_, i) => (i === csvAcqYear && csvLoan.loanAmount > 0 ? csvLoan.loanAmount : 0).toFixed(0))],
+      ["Less: Principal Repayments", ...cashFlowData.map(y => (-y.principalPayment).toFixed(0))],
+      ["Refinancing Proceeds", ...cashFlowData.map(y => y.refinancingProceeds.toFixed(0))],
+      ["Net Cash from Financing Activities", ...s.cashFromFinancing.map(v => v.toFixed(0))],
+      [""],
+      ["Net Increase (Decrease) in Cash", ...s.netChangeCash.map(v => v.toFixed(0))],
+      ["Opening Cash Balance", ...s.openingCash.map(v => v.toFixed(0))],
+      ["Closing Cash Balance", ...s.closingCash.map(v => v.toFixed(0))],
+      [""],
+      ["FREE CASH FLOW"],
+      ["Net Cash from Operating Activities", ...s.cashFromOperations.map(v => v.toFixed(0))],
+      ["Less: Capital Expenditures (FF&E)", ...yearlyDetails.map(y => (-y.expenseFFE).toFixed(0))],
+      ["Free Cash Flow (FCF)", ...s.fcf.map(v => v.toFixed(0))],
+      ["Less: Principal Payments", ...cashFlowData.map(y => (-y.principalPayment).toFixed(0))],
+      ["Free Cash Flow to Equity (FCFE)", ...s.fcfe.map(v => v.toFixed(0))],
+    ];
+
+    downloadCSV(
+      [headers, ...rows].map(row => row.join(",")).join("\n"),
+      `${property.name.replace(/\s+/g, '_')}_CashFlow.csv`,
+    );
+  };
+
+  const handleExcelExport = () => {
+    if (activeTab === "income") {
+      exportPropertyIncomeStatement(
+        financials,
+        property.name,
+        projectionYears,
+        global.modelStartDate,
+        fiscalYearStartMonth
+      );
+    } else if (activeTab === "cashflow") {
+      exportPropertyCashFlow(
+        financials,
+        property as unknown as LoanParams,
+        global as unknown as GlobalLoanParams,
+        property.name,
+        projectionYears,
+        global.modelStartDate,
+        fiscalYearStartMonth
+      );
+    } else if (activeTab === "balance") {
+      exportPropertyBalanceSheet(
+        [property] as unknown as LoanParams[],
+        global,
+        [{ property: property as unknown as LoanParams, data: financials }],
+        projectionYears,
+        global.modelStartDate,
+        fiscalYearStartMonth,
+        property.name,
+        0
+      );
+    }
+  };
+
+  const exportCashFlowPDF = async (orientation: 'landscape' | 'portrait' = 'landscape') => {
+
+    const cashFlowData = getCashFlowData();
+    const doc = new jsPDF({ orientation, unit: "mm", format: "a4" });
+    const pageWidth = orientation === 'landscape' ? 297 : 210;
+    const chartWidth = pageWidth - 28;
+    
+    doc.setFontSize(16);
+    doc.text(`${property.name} - Cash Flow Statement`, 14, 15);
+    doc.setFontSize(10);
+    doc.text(`Generated: ${new Date().toLocaleDateString()}`, 14, 22);
+    
+    const chartStartY = 28;
+
+    const headers = [["Line Item", ...Array.from({length: years}, (_, i) => `FY ${startYear + i}`)]];
+    
+    const fmtNum = (n: number) => n === 0 ? "-" : formatMoney(n);
+    
+    const pdfLoan = calculateLoanParams(property as LoanParams, global as GlobalLoanParams);
+    const pdfAcqYear = Math.floor(pdfLoan.acqMonthsFromModelStart / 12);
+    const pdfTotalPropertyCost = (property as any).purchasePrice + ((property as any).buildingImprovements ?? 0) + ((property as any).preOpeningCosts ?? 0);
+    
+    const pdfCfo = yearlyDetails.map((yd, i) => {
+      return yd.revenueTotal - (yd.totalExpenses - yd.expenseFFE) - cashFlowData[i].interestExpense - cashFlowData[i].taxLiability;
+    });
+    const pdfCfi = cashFlowData.map((cf, i) => {
+      const ffe = yearlyDetails[i].expenseFFE;
+      const acqCost = i === pdfAcqYear ? pdfTotalPropertyCost : 0;
+      return -acqCost - ffe + cf.exitValue;
+    });
+    const pdfCff = cashFlowData.map((cf, i) => {
+      const eqContrib = i === pdfAcqYear ? pdfLoan.equityInvested : 0;
+      const loanProceeds = i === pdfAcqYear && pdfLoan.loanAmount > 0 ? pdfLoan.loanAmount : 0;
+      return eqContrib + loanProceeds - cf.principalPayment + cf.refinancingProceeds;
+    });
+    const pdfNetChange = pdfCfo.map((cfo, i) => cfo + pdfCfi[i] + pdfCff[i]);
+    let pdfRunCash = 0;
+    const pdfOpenCash: number[] = [];
+    const pdfCloseCash: number[] = [];
+    for (let i = 0; i < years; i++) {
+      pdfOpenCash.push(pdfRunCash);
+      pdfRunCash += pdfNetChange[i];
+      pdfCloseCash.push(pdfRunCash);
+    }
+    
+    const iceBlueHeader = [232, 244, 253];
+
+    const body = [
+      [{ content: "CASH FLOW FROM OPERATING ACTIVITIES", colSpan: years + 1, styles: { fontStyle: "bold", fillColor: iceBlueHeader } }],
+      [{ content: "Cash Received from Guests & Clients", styles: { fontStyle: "bold" } }, ...yearlyDetails.map(y => ({ content: fmtNum(y.revenueTotal), styles: { fontStyle: "bold" } }))],
+      ["  Guest Room Revenue", ...yearlyDetails.map(y => fmtNum(y.revenueRooms))],
+      ["  Event & Venue Revenue", ...yearlyDetails.map(y => fmtNum(y.revenueEvents))],
+      ["  Food & Beverage Revenue", ...yearlyDetails.map(y => fmtNum(y.revenueFB))],
+      ["  Other Revenue (Spa/Experiences)", ...yearlyDetails.map(y => fmtNum(y.revenueOther))],
+      ["Cash Paid for Operating Expenses", ...yearlyDetails.map(y => fmtNum(-(y.totalExpenses - y.expenseFFE)))],
+      ["Less: Interest Paid", ...cashFlowData.map(y => fmtNum(-y.interestExpense))],
+      ["Less: Income Taxes Paid", ...cashFlowData.map(y => fmtNum(-y.taxLiability))],
+      [{ content: "Net Cash from Operating Activities", styles: { fontStyle: "bold", fillColor: [208, 234, 251] } }, ...pdfCfo.map(v => ({ content: fmtNum(v), styles: { fontStyle: "bold", fillColor: [208, 234, 251] } }))],
+      [{ content: "CASH FLOW FROM INVESTING ACTIVITIES", colSpan: years + 1, styles: { fontStyle: "bold", fillColor: iceBlueHeader } }],
+      ["Property Acquisition", ...cashFlowData.map((_, i) => fmtNum(i === pdfAcqYear ? -pdfTotalPropertyCost : 0))],
+      ["FF&E Reserve / Capital Improvements", ...yearlyDetails.map(y => fmtNum(-y.expenseFFE))],
+      ["Sale Proceeds (Net Exit Value)", ...cashFlowData.map(y => fmtNum(y.exitValue))],
+      [{ content: "Net Cash from Investing Activities", styles: { fontStyle: "bold", fillColor: [208, 234, 251] } }, ...pdfCfi.map(v => ({ content: fmtNum(v), styles: { fontStyle: "bold", fillColor: [208, 234, 251] } }))],
+      [{ content: "CASH FLOW FROM FINANCING ACTIVITIES", colSpan: years + 1, styles: { fontStyle: "bold", fillColor: iceBlueHeader } }],
+      ["Equity Contribution", ...cashFlowData.map((_, i) => fmtNum(i === pdfAcqYear ? pdfLoan.equityInvested : 0))],
+      ["Loan Proceeds", ...cashFlowData.map((_, i) => fmtNum(i === pdfAcqYear && pdfLoan.loanAmount > 0 ? pdfLoan.loanAmount : 0))],
+      ["Less: Principal Repayments", ...cashFlowData.map(y => fmtNum(-y.principalPayment))],
+      ["Refinancing Proceeds", ...cashFlowData.map(y => fmtNum(y.refinancingProceeds))],
+      [{ content: "Net Cash from Financing Activities", styles: { fontStyle: "bold", fillColor: [208, 234, 251] } }, ...pdfCff.map(v => ({ content: fmtNum(v), styles: { fontStyle: "bold", fillColor: [208, 234, 251] } }))],
+      [{ content: "Net Increase (Decrease) in Cash", styles: { fontStyle: "bold" } }, ...pdfNetChange.map(v => ({ content: fmtNum(v), styles: { fontStyle: "bold" } }))],
+      ["Opening Cash Balance", ...pdfOpenCash.map(v => fmtNum(v))],
+      [{ content: "Closing Cash Balance", styles: { fontStyle: "bold" } }, ...pdfCloseCash.map(v => ({ content: fmtNum(v), styles: { fontStyle: "bold" } }))],
+      [{ content: "FREE CASH FLOW", colSpan: years + 1, styles: { fontStyle: "bold", fillColor: iceBlueHeader } }],
+      ["Net Cash from Operating Activities", ...pdfCfo.map(v => fmtNum(v))],
+      ["Less: Capital Expenditures (FF&E)", ...yearlyDetails.map(y => fmtNum(-y.expenseFFE))],
+      [{ content: "Free Cash Flow (FCF)", styles: { fontStyle: "bold" } }, ...pdfCfo.map((cfo, i) => ({ content: fmtNum(cfo - yearlyDetails[i].expenseFFE), styles: { fontStyle: "bold" } }))],
+      ["Less: Principal Payments", ...cashFlowData.map(y => fmtNum(-y.principalPayment))],
+      [{ content: "Free Cash Flow to Equity (FCFE)", styles: { fontStyle: "bold" } }, ...pdfCfo.map((cfo, i) => ({ content: fmtNum(cfo - yearlyDetails[i].expenseFFE - cashFlowData[i].principalPayment), styles: { fontStyle: "bold" } }))],
+    ];
+
+    const colStyles: Record<number, any> = { 0: { cellWidth: 45, halign: 'left' } };
+    for (let i = 1; i <= years; i++) {
+      colStyles[i] = { halign: 'right' };
+    }
+
+    autoTable(doc, {
+      head: headers,
+      body: body as any,
+      startY: chartStartY,
+      theme: "grid",
+      styles: { fontSize: 7, cellPadding: 1.5 },
+      headStyles: { fillColor: [240, 240, 240], textColor: [61, 61, 61], fontStyle: "bold", halign: 'center' },
+      columnStyles: colStyles,
+    });
+
+    if (yearlyChartData && yearlyChartData.length > 0) {
+      doc.addPage();
+      doc.setFontSize(16);
+      doc.text(`${property.name} - Performance Chart`, 14, 15);
+      doc.setFontSize(10);
+      
+      const chartSeries = activeTab === "cashflow" ? [
+        {
+          name: 'Revenue',
+          data: yearlyChartData.map((d: any) => ({ label: d.year, value: d.Revenue })),
+          color: '#257D41'
+        },
+        {
+          name: 'ANOI',
+          data: yearlyChartData.map((d: any) => ({ label: d.year, value: d.ANOI })),
+          color: '#3B82F6'
+        },
+        {
+          name: 'Cash Flow',
+          data: yearlyChartData.map((d: any) => ({ label: d.year, value: d.CashFlow })),
+          color: '#F4795B'
+        }
+      ] : [
+        {
+          name: 'Revenue',
+          data: yearlyChartData.map((d: any) => ({ label: d.year, value: d.Revenue })),
+          color: '#257D41'
+        },
+        {
+          name: 'GOP',
+          data: yearlyChartData.map((d: any) => ({ label: d.year, value: d.GOP })),
+          color: '#3B82F6'
+        },
+        {
+          name: 'ANOI',
+          data: yearlyChartData.map((d: any) => ({ label: d.year, value: d.ANOI })),
+          color: '#F4795B'
+        }
+      ];
+      
+      const chartTitle = activeTab === "cashflow" 
+        ? `${projectionYears}-Year Revenue, ANOI, and Cash Flow Trend`
+        : `${projectionYears}-Year Revenue, GOP, and ANOI Trend`;
+      doc.text(chartTitle, 14, 22);
+      
+      drawLineChart({
+        doc,
+        x: 14,
+        y: 30,
+        width: chartWidth,
+        height: 150,
+        title: `${property.name} - Financial Performance (${projectionYears}-Year Projection)`,
+        series: chartSeries
+      });
+    }
+
+    doc.save(`${property.name.replace(/\s+/g, '_')}_CashFlow.pdf`);
+  };
+
+  const exportChartPNG = async (orientation: 'landscape' | 'portrait' = 'landscape') => {
+    const chartContainer = activeTab === "cashflow" ? cashFlowChartRef.current : incomeChartRef.current;
+    if (!chartContainer) return;
+    try {
+      const width = orientation === 'landscape' ? 1200 : 800;
+      const height = orientation === 'landscape' ? 600 : 1000;
+      
+      const dataUrl = await domtoimage.toPng(chartContainer, {
+        bgcolor: '#ffffff',
+        quality: 1,
+        width,
+        height,
+        style: { transform: 'scale(2)', transformOrigin: 'top left' }
+      });
+      const link = document.createElement('a');
+      link.download = `${property.name.replace(/\s+/g, '_')}_chart_${orientation}.png`;
+      link.href = dataUrl;
+      link.click();
+    } catch (error) {
+      console.error('Error exporting chart:', error);
+    }
+  };
+
+  const exportTablePNG = async (orientation: 'landscape' | 'portrait' = 'landscape') => {
+    const tableContainer = activeTab === "cashflow" ? cashFlowTableRef.current : incomeTableRef.current;
+    if (!tableContainer) return;
+    try {
+      const scale = 2;
+      const dataUrl = await domtoimage.toPng(tableContainer, {
+        bgcolor: '#ffffff',
+        quality: 1,
+        style: { transform: `scale(${scale})`, transformOrigin: 'top left' },
+        width: tableContainer.scrollWidth * scale,
+        height: tableContainer.scrollHeight * scale,
+      });
+      const link = document.createElement('a');
+      link.download = `${property.name.replace(/\s+/g, '_')}_${activeTab}_table.png`;
+      link.href = dataUrl;
+      link.click();
+    } catch (error) {
+      console.error('Error exporting table:', error);
+    }
+  };
+
+  const handlePPTXExport = () => {
+
+    const cashFlowData = getCashFlowData();
+    const yearLabels = Array.from({ length: years }, (_, i) => `FY ${startYear + i}`);
+
+    const incomeRows = [
+      { category: "REVENUE", values: yearlyDetails.map(() => 0) },
+      { category: "Room Revenue", values: yearlyDetails.map(y => y.revenueRooms), indent: 1 },
+      { category: "Event Revenue", values: yearlyDetails.map(y => y.revenueEvents), indent: 1 },
+      { category: "F&B Revenue", values: yearlyDetails.map(y => y.revenueFB), indent: 1 },
+      { category: "Other Revenue", values: yearlyDetails.map(y => y.revenueOther), indent: 1 },
+      { category: "Total Revenue", values: yearlyDetails.map(y => y.revenueTotal), isBold: true },
+      { category: "OPERATING EXPENSES", values: yearlyDetails.map(() => 0) },
+      { category: "Housekeeping", values: yearlyDetails.map(y => y.expenseRooms), indent: 1 },
+      { category: "F&B", values: yearlyDetails.map(y => y.expenseFB), indent: 1 },
+      { category: "Marketing", values: yearlyDetails.map(y => y.expenseMarketing), indent: 1 },
+      { category: "Property Ops", values: yearlyDetails.map(y => y.expensePropertyOps), indent: 1 },
+      { category: "Admin & General", values: yearlyDetails.map(y => y.expenseAdmin), indent: 1 },
+      { category: "Adjusted NOI (ANOI)", values: yearlyDetails.map(y => y.noi), isBold: true },
+    ];
+
+    const cfRows = [
+      { category: "Net Cash from Operating Activities", values: yearlyDetails.map((yd, i) => yd.revenueTotal - (yd.totalExpenses - yd.expenseFFE) - cashFlowData[i].interestExpense - cashFlowData[i].taxLiability), isBold: true },
+      { category: "FCFE", values: yearlyDetails.map((yd, i) => {
+        const cfo = yd.revenueTotal - (yd.totalExpenses - yd.expenseFFE) - cashFlowData[i].interestExpense - cashFlowData[i].taxLiability;
+        return cfo - yd.expenseFFE - cashFlowData[i].principalPayment;
+      }), isBold: true },
+    ];
+
+    const bsRows = [
+      { category: "Balance Sheet data exported via Excel", values: yearlyDetails.map(() => 0) },
+    ];
+
+    exportPropertyPPTX({
+      propertyName: property.name,
+      projectionYears,
+      getFiscalYear: (i: number) => `FY ${startYear + i}`,
+      incomeData: { years: yearLabels, rows: incomeRows },
+      cashFlowData: { years: yearLabels, rows: cfRows },
+      balanceSheetData: { years: yearLabels, rows: bsRows },
+    });
+  };
+
+  const handleExport = async (orientation: 'landscape' | 'portrait', version: ExportVersion) => {
+    const expand = version === "extended" && activeTab === "income";
+    if (expand) {
+      setIncomeAllExpanded(true);
+      await new Promise((r) => setTimeout(r, 300));
+    } else if (version === "short" && activeTab === "income") {
+      setIncomeAllExpanded(false);
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    try {
+      if (exportType === 'pdf') {
+        await exportCashFlowPDF(orientation);
+      } else if (exportType === 'tablePng') {
+        await exportTablePNG(orientation);
+      } else {
+        await exportChartPNG(orientation);
+      }
+    } finally {
+      if (expand) {
+        setIncomeAllExpanded(false);
+      }
+    }
+  };
+
+  return (
+    <Layout>
+      <AnimatedPage>
+      <ExportDialog
+        open={exportDialogOpen}
+        onClose={() => setExportDialogOpen(false)}
+        onExport={handleExport}
+        title={exportType === 'pdf' ? 'Export PDF' : exportType === 'tablePng' ? 'Export Table as PNG' : 'Export Chart'}
+        showVersionOption={activeTab === "income" || activeTab === "cashflow"}
+      />
+      <div className="space-y-6">
+        <PropertyHeader
+          property={property}
+          propertyId={propertyId}
+          onPhotoUploadComplete={handlePhotoUploadComplete}
+        />
+
+        <PropertyKPIs
+          yearlyChartData={yearlyChartData}
+          projectionYears={projectionYears}
+        />
+
+        <BenchmarkPanel
+          property={property}
+          yearlyChartData={yearlyChartData}
+        />
+
+        <ScrollReveal>
+        <CalcDetailsProvider show={global?.showPropertyCalculationDetails ?? true}>
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+          <div className="mb-4">
+            <CurrentThemeTab
+              tabs={[
+                { value: 'income', label: 'Income Statement', icon: IconIncomeStatement },
+                { value: 'cashflow', label: 'Cash Flows', icon: IconCashFlow },
+                { value: 'balance', label: 'Balance Sheet', icon: IconBalanceSheet },
+                { value: 'ppe', label: 'PP&E / Cost Basis', icon: IconPPE }
+              ]}
+              activeTab={activeTab}
+              onTabChange={setActiveTab}
+              rightContent={
+                <ExportMenu
+                  variant="light"
+                  actions={[
+                    pdfAction(() => { setExportType('pdf'); setExportDialogOpen(true); }),
+                    excelAction(() => handleExcelExport()),
+                    csvAction(() => exportCashFlowCSV()),
+                    pptxAction(() => handlePPTXExport()),
+                    chartAction(() => { setExportType('chart'); setExportDialogOpen(true); }),
+                    pngAction(() => { setExportType('tablePng'); setExportDialogOpen(true); }),
+                  ]}
+                />
+              }
+            />
+          </div>
+          
+          <TabsContent value="income" className="mt-6">
+            <IncomeStatementTab
+              yearlyChartData={yearlyChartData}
+              yearlyDetails={yearlyDetails}
+              financials={financials}
+              property={property}
+              global={global}
+              projectionYears={projectionYears}
+              startYear={startYear}
+              incomeChartRef={incomeChartRef}
+              incomeTableRef={incomeTableRef}
+              incomeAllExpanded={incomeAllExpanded}
+            />
+          </TabsContent>
+          
+          <TabsContent value="cashflow" className="mt-6">
+            <CashFlowTab
+              yearlyChartData={yearlyChartData}
+              cashFlowData={cashFlowDataMemo}
+              yearlyDetails={yearlyDetails}
+              financials={financials}
+              property={property}
+              global={global}
+              projectionYears={projectionYears}
+              startYear={startYear}
+              cashFlowChartRef={cashFlowChartRef}
+              cashFlowTableRef={cashFlowTableRef}
+            />
+          </TabsContent>
+
+          <TabsContent value="balance" className="mt-6">
+            <ConsolidatedBalanceSheet
+              properties={[property]}
+              global={global}
+              allProFormas={[{ property, data: financials }]}
+              year={projectionYears}
+              propertyIndex={0}
+            />
+          </TabsContent>
+
+          <TabsContent value="ppe" className="mt-6">
+            <PPECostBasisSchedule property={property} global={global} />
+          </TabsContent>
+        </Tabs>
+        </CalcDetailsProvider>
+        </ScrollReveal>
+      </div>
+      </AnimatedPage>
+    </Layout>
+  );
+}
